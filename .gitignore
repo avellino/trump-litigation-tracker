@@ -1,0 +1,23 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+
+# Cached API responses (large, regenerable)
+data/raw/courtlistener_responses/
+
+# Logs
+data/pipeline_errors.log
+data/unmatched_cases.txt
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+*.egg-info/
+dist/
+build/

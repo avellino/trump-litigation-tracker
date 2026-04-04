@@ -1,0 +1,12 @@
+# Visualization app (deployed)
+streamlit>=1.28.0
+plotly>=5.18.0
+pandas>=2.0.0
+
+# Pipeline dependencies (only needed locally for data enrichment)
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+python-dotenv>=1.0.0
+thefuzz>=0.22.0
+python-Levenshtein>=0.23.0
