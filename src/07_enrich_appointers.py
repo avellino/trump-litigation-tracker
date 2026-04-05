@@ -3,30 +3,35 @@
 Step 7: Enrich Judge Appointer Data
 
 For each judge in the database, look up which president appointed them
-using CourtListener's People and Positions APIs.
+using two data sources:
 
-Strategy:
-  1. For each unique judge_name, try to find their CourtListener person record:
+  1. CourtListener People/Positions API (primary)
      a. Check if any of their dockets have an `assigned_to` URL (direct person link)
-     b. Fallback: search People API by last name + first name
-  2. Fetch the person's positions (judicial appointments)
-  3. Follow the `appointer` field (a position URL) to get the president's name
-  4. Store the appointing president in the `appointed_by` column of cases table
+     b. Search People API by last name + first name
+     c. Fetch positions → follow appointer URL → resolve president name
+  2. FJC Biographical Database CSV (fallback)
+     - Authoritative government source covering all Article III judges
+     - Downloaded from https://www.fjc.gov/history/judges/biographical-directory-article-iii-federal-judges-export
+     - Matched by last name + first name with fuzzy suffix/punctuation handling
 
 Usage:
     python src/07_enrich_appointers.py [limit]
 """
 
+import csv
 import re
 import sqlite3
 import sys
 import time
+import unicodedata
+from pathlib import Path
 from typing import Optional
 
 from utils import (
     COURTLISTENER_BASE_URL,
     COURTLISTENER_TOKEN,
     DB_PATH,
+    SEED_DIR,
     log_error,
     logger,
     make_api_call,
@@ -35,8 +40,177 @@ from utils import (
     save_cache,
 )
 
+FJC_CSV_PATH = SEED_DIR / "fjc_judges.csv"
+FJC_DOWNLOAD_URL = "https://www.fjc.gov/sites/default/files/history/judges.csv"
+
 # Cache president names by position URL to avoid redundant lookups
 _president_cache: dict[str, Optional[str]] = {}
+
+# Suffixes to strip from judge names for matching
+NAME_SUFFIXES = {"jr.", "jr", "sr.", "sr", "ii", "iii", "iv", "v"}
+
+
+# ---------------------------------------------------------------------------
+# FJC Biographical Database Lookup
+# ---------------------------------------------------------------------------
+
+class FJCLookup:
+    """Lookup judge appointers from the FJC Biographical Database CSV."""
+
+    def __init__(self, csv_path: Path = FJC_CSV_PATH):
+        self._lookup: dict[tuple[str, str], str] = {}  # (last, first) -> president
+        self._lookup_normalized: dict[tuple[str, str], str] = {}  # normalized keys
+        self._loaded = False
+        self._csv_path = csv_path
+
+    def _ensure_loaded(self) -> bool:
+        if self._loaded:
+            return bool(self._lookup)
+
+        if not self._csv_path.exists():
+            logger.info("FJC CSV not found, attempting download...")
+            if not self._download():
+                logger.warning("FJC CSV unavailable — FJC fallback disabled")
+                self._loaded = True
+                return False
+
+        try:
+            with open(self._csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    last = row.get('Last Name', '').strip()
+                    first = row.get('First Name', '').strip()
+                    if not last or not first:
+                        continue
+
+                    # Get the most recent appointment (highest numbered non-empty)
+                    president = None
+                    for i in range(1, 7):
+                        p = row.get(f'Appointing President ({i})', '').strip()
+                        if p:
+                            president = p
+
+                    if president:
+                        # Exact key
+                        self._lookup[(last.lower(), first.lower())] = president
+                        # Normalized key (strip accents, punctuation)
+                        norm_last = self._normalize(last)
+                        norm_first = self._normalize(first)
+                        self._lookup_normalized[(norm_last, norm_first)] = president
+
+            self._loaded = True
+            logger.info(f"Loaded {len(self._lookup)} judges from FJC database")
+            return True
+        except Exception as e:
+            log_error(e, "Loading FJC CSV")
+            self._loaded = True
+            return False
+
+    def _download(self) -> bool:
+        """Download the FJC judges CSV."""
+        try:
+            import urllib.request
+            logger.info(f"Downloading FJC judges CSV from {FJC_DOWNLOAD_URL}...")
+            urllib.request.urlretrieve(FJC_DOWNLOAD_URL, self._csv_path)
+            logger.info("Download complete.")
+            return True
+        except Exception as e:
+            log_error(e, "Downloading FJC CSV")
+            return False
+
+    @staticmethod
+    def _normalize(name: str) -> str:
+        """Normalize a name: strip accents, apostrophes, hyphens, lowercase."""
+        # Decompose unicode and strip combining marks (accents)
+        nfkd = unicodedata.normalize('NFKD', name)
+        ascii_name = ''.join(c for c in nfkd if not unicodedata.combining(c))
+        # Remove apostrophes, hyphens, periods
+        ascii_name = re.sub(r"['\-.]", "", ascii_name)
+        # Collapse spaces
+        return re.sub(r'\s+', ' ', ascii_name).strip().lower()
+
+    def find_president(self, judge_name: str) -> Optional[str]:
+        """Look up which president appointed a judge.
+
+        Tries multiple matching strategies:
+        1. Exact (last, first) match
+        2. Suffix-stripped match (Jr., III, etc.)
+        3. Normalized match (accents, apostrophes)
+        4. Prefix match on first name (3+ chars)
+        """
+        if not self._ensure_loaded():
+            return None
+
+        parts = judge_name.strip().split()
+        if len(parts) < 2:
+            return None
+
+        first = parts[0].lower()
+        last = parts[-1].lower()
+
+        # Strip suffixes from last position
+        if last in NAME_SUFFIXES and len(parts) >= 3:
+            last = parts[-2].lower()
+            # Also strip period from suffix-adjacent name
+            last = last.rstrip('.')
+
+        # Strategy 1: Exact match
+        result = self._lookup.get((last, first))
+        if result:
+            return result
+
+        # Strategy 2: Try with middle name as first name (some FJC entries use middle)
+        if len(parts) >= 3:
+            middle = parts[1].lower().rstrip('.')
+            result = self._lookup.get((last, middle))
+            if result:
+                return result
+
+        # Strategy 3: Normalized match (handles O'Toole→Otoole, Noël→Noel, etc.)
+        norm_last = self._normalize(last)
+        norm_first = self._normalize(first)
+        result = self._lookup_normalized.get((norm_last, norm_first))
+        if result:
+            return result
+
+        # Strategy 4: Handle compound last names (Van Tatenhove vs VanTatenhove)
+        # If normalized last name > 5 chars, try splitting at capital boundaries
+        if len(last) > 5:
+            # Try adding space before internal capitals: VanTatenhove -> van tatenhove
+            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', parts[-1] if parts[-1].lower() not in NAME_SUFFIXES else parts[-2])
+            spaced_parts = spaced.lower().split()
+            if len(spaced_parts) == 2:
+                result = self._lookup.get((spaced_parts[1], first))
+                if result:
+                    return result
+                # Try "Van Tatenhove" style: (compound last, first)
+                compound = " ".join(spaced_parts)
+                for (l, f), pres in self._lookup.items():
+                    if l == compound and f.startswith(first[:3]):
+                        return pres
+
+        # Strategy 5: First-name prefix match (at least 3 chars)
+        if len(first) >= 3:
+            for (l, f), pres in self._lookup.items():
+                if l == last and (f.startswith(first[:3]) or first.startswith(f[:3])):
+                    return pres
+            # Also try normalized
+            for (l, f), pres in self._lookup_normalized.items():
+                if l == norm_last and (f.startswith(norm_first[:3]) or norm_first.startswith(f[:3])):
+                    return pres
+
+        # Strategy 6: Match by collapsing spaces in FJC last names
+        # Handles "Van Tatenhove" in FJC matching "Vantatenhove" in our DB
+        collapsed_last = last.replace(" ", "")
+        for (l, f), pres in self._lookup.items():
+            if l.replace(" ", "") == collapsed_last and f.startswith(first[:3]):
+                return pres
+
+        return None
+
+
+# Global FJC lookup instance
+_fjc = FJCLookup()
 
 
 def parse_judge_name(judge_name: str) -> tuple[str, str, str]:
@@ -65,8 +239,11 @@ def parse_judge_name(judge_name: str) -> tuple[str, str, str]:
 def is_multi_judge(judge_name: str) -> bool:
     """Detect multi-judge panel names like 'Gary S. Katzmann Timothy M. Reif Jane A. Restani'."""
     parts = judge_name.strip().split()
-    # Count how many parts look like first names (capitalized, no period)
-    cap_no_period = [p for p in parts if p[0].isupper() and not p.endswith('.') and len(p) > 2]
+    # Exclude suffixes and honorifics from counting
+    skip = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "v"}
+    # Count how many parts look like first names (capitalized, no period, not a suffix)
+    cap_no_period = [p for p in parts if p[0].isupper() and not p.endswith('.')
+                     and len(p) > 2 and p.lower() not in skip]
     return len(cap_no_period) >= 4
 
 
@@ -282,60 +459,76 @@ def lookup_judge_appointer(
 ) -> Optional[str]:
     """Main function to look up which president appointed a judge.
 
+    Tries two sources:
+      1. CourtListener People/Positions API
+      2. FJC Biographical Database (fallback)
+
     Returns president name string or None.
     """
     logger.info(f"Looking up appointer for: {judge_name}")
 
-    # Strategy 1: Check docket's assigned_to field for direct person URL
+    # ----- Source 1: CourtListener API -----
+
+    def _validate_cl_result(president_raw: str) -> Optional[str]:
+        """Validate a CourtListener result is a real president."""
+        normalized = normalize_president_name(president_raw)
+        if is_known_president(normalized):
+            return president_raw
+        logger.info(f"  CourtListener returned non-presidential appointer: {president_raw}")
+        return None
+
+    # Strategy 1a: Check docket's assigned_to field for direct person URL
     person_url = find_person_via_docket(conn, judge_name)
 
     if person_url:
         logger.info(f"  Found person via docket: {person_url}")
         positions = get_person_positions(person_url)
-    else:
-        # Strategy 2: Search People API
+
+        if positions:
+            jud_pos = find_judicial_position(positions, court_name)
+            if jud_pos and jud_pos.get("appointer"):
+                president = resolve_appointer(jud_pos["appointer"])
+                if president:
+                    validated = _validate_cl_result(president)
+                    if validated:
+                        logger.info(f"  Appointed by (CourtListener): {president}")
+                        return validated
+
+    # Strategy 1b: Search People API
+    if not person_url:
         person = find_person_via_search(judge_name)
-        if not person:
-            logger.warning(f"  Could not find person record for {judge_name}")
-            return None
+        if person:
+            person_id = person.get("id")
+            person_url = f"https://www.courtlistener.com/api/rest/v4/people/{person_id}/"
+            logger.info(f"  Found person via search: {person['name_first']} {person['name_last']} (id={person_id})")
 
-        person_id = person.get("id")
-        person_url = f"https://www.courtlistener.com/api/rest/v4/people/{person_id}/"
-        logger.info(f"  Found person via search: {person['name_first']} {person['name_last']} (id={person_id})")
+            pos_urls = person.get("positions", [])
+            if pos_urls and isinstance(pos_urls[0], str):
+                positions = get_person_positions(person_url)
+            elif pos_urls and isinstance(pos_urls[0], dict):
+                positions = pos_urls
+            else:
+                positions = get_person_positions(person_url)
 
-        # Get positions from the person record if they're included
-        pos_urls = person.get("positions", [])
-        if pos_urls and isinstance(pos_urls[0], str):
-            # Positions are URLs — need to fetch via positions endpoint
-            positions = get_person_positions(person_url)
-        elif pos_urls and isinstance(pos_urls[0], dict):
-            positions = pos_urls
-        else:
-            positions = get_person_positions(person_url)
+            if positions:
+                jud_pos = find_judicial_position(positions, court_name)
+                if jud_pos and jud_pos.get("appointer"):
+                    president = resolve_appointer(jud_pos["appointer"])
+                    if president:
+                        validated = _validate_cl_result(president)
+                        if validated:
+                            logger.info(f"  Appointed by (CourtListener): {president}")
+                            return validated
 
-    if not positions:
-        logger.warning(f"  No positions found for {judge_name}")
-        return None
+    # ----- Source 2: FJC Biographical Database -----
+    logger.info(f"  CourtListener lookup failed, trying FJC database...")
+    fjc_president = _fjc.find_president(judge_name)
+    if fjc_president:
+        logger.info(f"  Appointed by (FJC): {fjc_president}")
+        return fjc_president
 
-    # Find the judicial position
-    jud_pos = find_judicial_position(positions, court_name)
-    if not jud_pos:
-        logger.warning(f"  No judicial position found for {judge_name}")
-        return None
-
-    # Get appointer
-    appointer_url = jud_pos.get("appointer")
-    if not appointer_url:
-        logger.warning(f"  No appointer listed for {judge_name}")
-        return None
-
-    president = resolve_appointer(appointer_url)
-    if president:
-        logger.info(f"  Appointed by: {president}")
-    else:
-        logger.warning(f"  Could not resolve appointer URL: {appointer_url}")
-
-    return president
+    logger.warning(f"  Could not find appointer for {judge_name} in any source")
+    return None
 
 
 def main():
@@ -459,38 +652,66 @@ def normalize_president_name(name: str) -> str:
     """Normalize president names to consistent short forms."""
     name = name.strip()
 
-    # Map full names (first middle last) from CourtListener to common names
-    # resolve_appointer now returns "{first} {middle} {last}"
+    # Map full names from CourtListener and FJC to common display names.
+    # CourtListener returns "{first} {middle} {last}" (e.g. "Barack Hussein Obama")
+    # FJC returns formal names (e.g. "Joseph R. Biden", "William J. Clinton")
     mappings = {
+        # Barack Obama
         "barack hussein obama": "Barack Obama",
         "barack obama": "Barack Obama",
+        # Donald Trump
         "donald john trump": "Donald Trump",
+        "donald j. trump": "Donald Trump",
         "donald trump": "Donald Trump",
+        # Joe Biden
         "joseph robinette biden": "Joe Biden",
+        "joseph r. biden": "Joe Biden",
         "joseph biden": "Joe Biden",
+        "joe biden": "Joe Biden",
+        # George W. Bush
         "george w. bush": "George W. Bush",
         "george walker bush": "George W. Bush",
-        "george bush": "George W. Bush",
+        # George H.W. Bush
         "george h.w. bush": "George H.W. Bush",
         "george herbert walker bush": "George H.W. Bush",
+        # Bill Clinton
         "william jefferson clinton": "Bill Clinton",
+        "william j. clinton": "Bill Clinton",
         "william clinton": "Bill Clinton",
+        "bill clinton": "Bill Clinton",
+        # Ronald Reagan
         "ronald wilson reagan": "Ronald Reagan",
         "ronald reagan": "Ronald Reagan",
+        # Jimmy Carter
         "james earl carter": "Jimmy Carter",
         "james carter": "Jimmy Carter",
+        "jimmy carter": "Jimmy Carter",
+        # Richard Nixon
         "richard milhous nixon": "Richard Nixon",
+        "richard m. nixon": "Richard Nixon",
         "richard nixon": "Richard Nixon",
+        # Lyndon B. Johnson
         "lyndon baines johnson": "Lyndon B. Johnson",
+        "lyndon b. johnson": "Lyndon B. Johnson",
         "lyndon johnson": "Lyndon B. Johnson",
+        # Gerald Ford
         "gerald rudolph ford": "Gerald Ford",
+        "gerald r. ford": "Gerald Ford",
         "gerald ford": "Gerald Ford",
+        # John F. Kennedy
         "john fitzgerald kennedy": "John F. Kennedy",
+        "john f. kennedy": "John F. Kennedy",
         "john kennedy": "John F. Kennedy",
+        # Dwight D. Eisenhower
         "dwight david eisenhower": "Dwight D. Eisenhower",
+        "dwight d. eisenhower": "Dwight D. Eisenhower",
         "dwight eisenhower": "Dwight D. Eisenhower",
+        # Harry S. Truman
         "harry s. truman": "Harry S. Truman",
         "harry truman": "Harry S. Truman",
+        # Franklin D. Roosevelt
+        "franklin d. roosevelt": "Franklin D. Roosevelt",
+        "franklin delano roosevelt": "Franklin D. Roosevelt",
     }
 
     lower = name.lower().strip()
@@ -498,6 +719,10 @@ def normalize_president_name(name: str) -> str:
     # Check exact matches
     if lower in mappings:
         return mappings[lower]
+
+    # Handle ambiguous "George Bush" from CourtListener (default to W.)
+    if lower == "george bush":
+        return "George W. Bush"
 
     # Partial match (e.g. extra suffixes like "II" or "Jr.")
     for key, val in mappings.items():
