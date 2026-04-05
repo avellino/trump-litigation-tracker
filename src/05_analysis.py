@@ -117,6 +117,7 @@ def compute_judge_stats(conn: sqlite3.Connection) -> list[dict]:
     query = """
     SELECT
         judge_name,
+        appointed_by,
         COUNT(*) as case_count,
         SUM(CASE WHEN status LIKE '%injunction%' OR status LIKE '%TRO%' THEN 1 ELSE 0 END) as injunctions,
         SUM(CASE WHEN status LIKE '%dismissed%' OR status LIKE '%denied%' THEN 1 ELSE 0 END) as dismissed
@@ -138,6 +139,7 @@ def compute_judge_stats(conn: sqlite3.Connection) -> list[dict]:
         results.append(
             {
                 "judge_name": row["judge_name"],
+                "appointed_by": row["appointed_by"] or "Unknown",
                 "case_count": case_count,
                 "injunctions": injunctions,
                 "dismissed": dismissed,
@@ -147,6 +149,28 @@ def compute_judge_stats(conn: sqlite3.Connection) -> list[dict]:
         )
 
     return results
+
+
+def compute_appointer_stats(conn: sqlite3.Connection) -> dict:
+    """Compute statistics about which presidents appointed the judges."""
+    # Distribution of cases by appointing president
+    query = """
+    SELECT
+        COALESCE(appointed_by, 'Unknown') as appointed_by,
+        COUNT(*) as case_count,
+        COUNT(DISTINCT judge_name) as judge_count
+    FROM cases
+    WHERE judge_name IS NOT NULL AND judge_name != ''
+    GROUP BY COALESCE(appointed_by, 'Unknown')
+    ORDER BY case_count DESC
+    """
+    df = pd.read_sql_query(query, conn)
+
+    return {
+        "distribution": df.to_dict(orient="records"),
+        "total_with_data": int(df[df["appointed_by"] != "Unknown"]["case_count"].sum()),
+        "total_judges_with_data": int(df[df["appointed_by"] != "Unknown"]["judge_count"].sum()),
+    }
 
 
 def compute_timeline(conn: sqlite3.Connection) -> list[dict]:
@@ -201,6 +225,7 @@ def compute_case_details(conn: sqlite3.Connection) -> list[dict]:
         court,
         court_type,
         judge_name,
+        appointed_by,
         executive_action,
         base_executive_action,
         status,
@@ -279,6 +304,9 @@ def main():
         logger.info("Computing judge stats...")
         judge_stats = compute_judge_stats(conn)
 
+        logger.info("Computing appointer stats...")
+        appointer_stats = compute_appointer_stats(conn)
+
         logger.info("Computing timeline...")
         timeline = compute_timeline(conn)
 
@@ -300,6 +328,7 @@ def main():
             "top_attorneys": top_attorneys,
             "top_organizations": top_orgs,
             "judge_stats": judge_stats,
+            "appointer_stats": appointer_stats,
             "timeline": timeline,
             "outcomes": outcomes,
             "case_details": case_details,

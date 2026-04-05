@@ -28,7 +28,7 @@ A single legal "battle" (e.g., *State of New York v. Trump* over the federal fun
 
 - **Overview Dashboard** — Battle/docket counts, executive action bar charts (toggle between battle-level and docket-level), court distribution, filing timeline
 - **Attorney Network** — Top plaintiff-side and defendant-side (DOJ) attorneys by case count, organization/firm frequency chart
-- **Judge Analysis** — Judge assignment counts, injunction and dismissal rates per judge
+- **Judge Analysis** — Judge assignment counts, appointing president breakdown (color-coded by party), injunction and dismissal rates per judge
 - **Case Explorer** — Searchable table with "All Dockets" / "Battles Only" toggle; click any case to see related dockets, parties, and attorneys
 - **Executive Action Breakdown** — Cases grouped by executive action with status breakdown chart
 
@@ -85,6 +85,9 @@ python src/05_analysis.py
 
 # Step 6 (optional): Re-cluster battles on existing DB without re-running enrichment
 python src/06_assign_battles.py
+
+# Step 7: Enrich with presidential appointer data for judges
+python src/07_enrich_appointers.py
 ```
 
 ## Running the Visualization App
@@ -114,6 +117,7 @@ src/
   04_enrich_metadata.py          # Pull judge, court, dates via dockets API
   05_analysis.py                 # Compute aggregate statistics
   06_assign_battles.py           # Cluster dockets into legal battles
+  07_enrich_appointers.py        # Look up which president appointed each judge
   utils.py                       # Shared utilities (API, caching, normalization)
   org_lookup.py                  # Organization name normalization patterns
 app.py                           # Streamlit visualization app
@@ -125,7 +129,7 @@ requirements.txt
 
 The SQLite database has three tables:
 
-- **`cases`** — One row per docket (637 rows). Includes `battle_id` to cluster related dockets, `is_appeal` flag, `parent_docket` reference, judge, court, dates, executive action.
+- **`cases`** — One row per docket (637 rows). Includes `battle_id` to cluster related dockets, `is_appeal` flag, `parent_docket` reference, judge, `appointed_by` (appointing president), court, dates, executive action.
 - **`parties`** — Parties per docket (plaintiffs, defendants, intervenors). ~14,000 rows.
 - **`attorneys`** — Attorneys per docket with role (plaintiff_attorney / defendant_attorney) and organization/firm. ~11,000 rows.
 
@@ -136,6 +140,7 @@ The SQLite database has three tables:
 - **API strategy**: The CourtListener `/parties/` and `/attorneys/` endpoints require elevated access. We use the `/search/?q=docket_id:X&type=r` endpoint instead, which returns party, attorney, and firm data in search results.
 - **Caching**: Every API response is cached to disk as JSON. The pipeline is fully re-runnable without re-fetching.
 - **Rate limiting**: 1 request/second (well within CourtListener's 5,000/hour cap).
+- **Judge appointer lookup**: For each judge, searches CourtListener's People API, fetches their positions, finds federal judicial appointments, and follows the `appointer` field to identify which president appointed them. Covers ~67% of cases (118/190 judges); newer appointees often lack People records.
 - **Organization normalization**: 50+ regex patterns map variations (e.g., "ACLU Foundation", "American Civil Liberties Union") to canonical names.
 
 ## Limitations

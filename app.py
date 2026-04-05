@@ -173,15 +173,118 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
 
     df = pd.DataFrame(judge_data)
 
-    st.subheader("Judges by Case Count")
-    st.dataframe(df.head(30), use_container_width=True, hide_index=True)
+    # Appointer distribution (show first if data available)
+    appointer_stats = analysis.get("appointer_stats", {})
+    appointer_dist = appointer_stats.get("distribution", [])
+    if appointer_dist:
+        st.subheader("Cases by Appointing President")
 
-    # Bar chart
-    fig = px.bar(
-        df.head(20), x="case_count", y="judge_name",
-        orientation="h", title="Top 20 Judges by Docket Count",
-        labels={"case_count": "Dockets", "judge_name": ""},
-    )
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            df_app = pd.DataFrame(appointer_dist)
+            # Filter out "Unknown" for the chart
+            df_known = df_app[df_app["appointed_by"] != "Unknown"]
+            if not df_known.empty:
+                # Define party colors for presidents
+                president_colors = {
+                    "Barack Obama": "#2166ac",
+                    "Donald Trump": "#b2182b",
+                    "Joe Biden": "#2166ac",
+                    "George W. Bush": "#b2182b",
+                    "Bill Clinton": "#2166ac",
+                    "Ronald Reagan": "#b2182b",
+                    "George H.W. Bush": "#b2182b",
+                    "Jimmy Carter": "#2166ac",
+                    "Richard Nixon": "#b2182b",
+                    "Lyndon B. Johnson": "#2166ac",
+                    "Gerald Ford": "#b2182b",
+                    "John F. Kennedy": "#2166ac",
+                    "Dwight D. Eisenhower": "#b2182b",
+                }
+                df_known["color"] = df_known["appointed_by"].map(
+                    lambda x: president_colors.get(x, "#999999")
+                )
+                fig = px.bar(
+                    df_known, x="case_count", y="appointed_by",
+                    orientation="h",
+                    title="Dockets by Appointing President",
+                    labels={"case_count": "Dockets", "appointed_by": ""},
+                    color="appointed_by",
+                    color_discrete_map=president_colors,
+                )
+                fig.update_layout(
+                    yaxis={"categoryorder": "total ascending"},
+                    showlegend=False,
+                    height=400,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            total_with = appointer_stats.get("total_with_data", 0)
+            total_judges = appointer_stats.get("total_judges_with_data", 0)
+            st.metric("Judges with Appointer Data", total_judges)
+            st.metric("Cases Covered", total_with)
+
+            # Show party breakdown
+            dem_presidents = {"Barack Obama", "Joe Biden", "Bill Clinton", "Jimmy Carter",
+                            "Lyndon B. Johnson", "John F. Kennedy", "Harry S. Truman"}
+            rep_presidents = {"Donald Trump", "George W. Bush", "George H.W. Bush",
+                            "Ronald Reagan", "Richard Nixon", "Gerald Ford", "Dwight D. Eisenhower"}
+            df_known_data = pd.DataFrame(appointer_dist)
+            df_known_data = df_known_data[df_known_data["appointed_by"] != "Unknown"]
+            dem_cases = df_known_data[df_known_data["appointed_by"].isin(dem_presidents)]["case_count"].sum()
+            rep_cases = df_known_data[df_known_data["appointed_by"].isin(rep_presidents)]["case_count"].sum()
+            if dem_cases or rep_cases:
+                st.write("**By party of appointing president:**")
+                st.write(f"🔵 Democrat appointees: {int(dem_cases)} cases")
+                st.write(f"🔴 Republican appointees: {int(rep_cases)} cases")
+
+        st.divider()
+
+    st.subheader("Judges by Case Count")
+
+    # Color-code judges by appointer if data available
+    if "appointed_by" in df.columns:
+        display_df = df.head(30).rename(columns={
+            "judge_name": "Judge",
+            "appointed_by": "Appointed By",
+            "case_count": "Cases",
+            "injunctions": "Injunctions",
+            "dismissed": "Dismissed",
+            "injunction_rate": "Injunction %",
+            "dismissal_rate": "Dismissal %",
+        })
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df.head(30), use_container_width=True, hide_index=True)
+
+    # Bar chart colored by appointer
+    chart_df = df.head(20).copy()
+    if "appointed_by" in chart_df.columns:
+        president_colors = {
+            "Barack Obama": "#2166ac",
+            "Donald Trump": "#b2182b",
+            "Joe Biden": "#2166ac",
+            "George W. Bush": "#b2182b",
+            "Bill Clinton": "#2166ac",
+            "Ronald Reagan": "#b2182b",
+            "George H.W. Bush": "#b2182b",
+            "Jimmy Carter": "#2166ac",
+            "Unknown": "#999999",
+        }
+        fig = px.bar(
+            chart_df, x="case_count", y="judge_name",
+            color="appointed_by",
+            orientation="h", title="Top 20 Judges by Docket Count",
+            labels={"case_count": "Dockets", "judge_name": "", "appointed_by": "Appointed By"},
+            color_discrete_map=president_colors,
+        )
+    else:
+        fig = px.bar(
+            chart_df, x="case_count", y="judge_name",
+            orientation="h", title="Top 20 Judges by Docket Count",
+            labels={"case_count": "Dockets", "judge_name": ""},
+        )
     fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=500)
     st.plotly_chart(fig, use_container_width=True)
 
@@ -218,6 +321,7 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
             c.case_name as "Case Name",
             c.court as "Court",
             c.judge_name as "Judge",
+            c.appointed_by as "Appointed By",
             COALESCE(c.base_executive_action, c.executive_action) as "Executive Action",
             c.status as "Status",
             c.date_filed as "Date Filed",
@@ -238,6 +342,7 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
             case_name as "Case Name",
             court as "Court",
             judge_name as "Judge",
+            appointed_by as "Appointed By",
             COALESCE(base_executive_action, executive_action) as "Executive Action",
             status as "Status",
             date_filed as "Date Filed",
