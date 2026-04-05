@@ -43,6 +43,29 @@ def query_df(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn)
 
 
+@st.cache_data(ttl=300)
+def _db_columns(_conn: sqlite3.Connection, table: str = "cases") -> set:
+    """Return set of column names for a table."""
+    cols = _conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row[1] for row in cols}
+
+
+def has_column(conn: sqlite3.Connection, col: str) -> bool:
+    return col in _db_columns(conn)
+
+
+def ea_expr(conn: sqlite3.Connection, prefix: str = "") -> str:
+    """Return the SQL expression for executive action, adapting to available columns.
+
+    Args:
+        prefix: Optional table alias prefix, e.g. "c." for use in JOINs.
+    """
+    p = f"{prefix}." if prefix and not prefix.endswith(".") else prefix
+    if has_column(conn, "base_executive_action"):
+        return f"COALESCE({p}base_executive_action, {p}executive_action)"
+    return f"{p}executive_action"
+
+
 # ---------------------------------------------------------------------------
 # Page: Overview Dashboard
 # ---------------------------------------------------------------------------
@@ -314,15 +337,24 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
     with col2:
         view_mode = st.radio("View", ["All Dockets", "Battles Only"], key="explorer_view")
 
-    if view_mode == "Battles Only":
-        # Show one row per battle (the earliest-filed docket in each battle)
-        sql = """
+    ea = ea_expr(conn)
+    has_battle = has_column(conn, "battle_id")
+    has_appeal = has_column(conn, "is_appeal")
+    has_appt = has_column(conn, "appointed_by")
+
+    appt_col_c = ", c.appointed_by as \"Appointed By\"" if has_appt else ""
+    appt_col = ", appointed_by as \"Appointed By\"" if has_appt else ""
+
+    ea_c = ea_expr(conn, "c")
+
+    if view_mode == "Battles Only" and has_battle:
+        sql = f"""
         SELECT
             c.case_name as "Case Name",
             c.court as "Court",
-            c.judge_name as "Judge",
-            c.appointed_by as "Appointed By",
-            COALESCE(c.base_executive_action, c.executive_action) as "Executive Action",
+            c.judge_name as "Judge"
+            {appt_col_c},
+            {ea_c} as "Executive Action",
             c.status as "Status",
             c.date_filed as "Date Filed",
             c.docket_number as "Docket #",
@@ -337,19 +369,21 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
         ORDER BY c.date_filed DESC, c.case_name
         """
     else:
-        sql = """
+        appeal_col = ", CASE WHEN is_appeal = 1 THEN 'Appeal' ELSE '' END as \"Type\"" if has_appeal else ""
+        battle_col = ", battle_id" if has_battle else ""
+        sql = f"""
         SELECT
             case_name as "Case Name",
             court as "Court",
-            judge_name as "Judge",
-            appointed_by as "Appointed By",
-            COALESCE(base_executive_action, executive_action) as "Executive Action",
+            judge_name as "Judge"
+            {appt_col},
+            {ea} as "Executive Action",
             status as "Status",
             date_filed as "Date Filed",
             docket_number as "Docket #",
-            courtlistener_docket_id as cl_id,
-            battle_id,
-            CASE WHEN is_appeal = 1 THEN 'Appeal' ELSE '' END as "Type"
+            courtlistener_docket_id as cl_id
+            {battle_col}
+            {appeal_col}
         FROM cases
         ORDER BY date_filed DESC, case_name
         """
@@ -385,10 +419,11 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
                         st.write(f"**{col}:** {val}")
 
                 # Show related dockets in the same battle
-                if battle_id and pd.notna(battle_id):
+                if has_battle and battle_id and pd.notna(battle_id):
+                    appeal_expr = "CASE WHEN is_appeal = 1 THEN 'Appeal' ELSE 'Original' END" if has_appeal else "'Original'"
                     related = query_df(conn, f"""
                         SELECT case_name, docket_number, court, status,
-                               CASE WHEN is_appeal = 1 THEN 'Appeal' ELSE 'Original' END as type
+                               {appeal_expr} as type
                         FROM cases WHERE battle_id = {int(battle_id)}
                         ORDER BY date_filed
                     """)
@@ -443,16 +478,17 @@ def page_executive_actions(conn: sqlite3.Connection, analysis: dict):
 
     st.dataframe(df_ea[display_cols], use_container_width=True, hide_index=True)
 
-    # Outcome by executive action (using base_executive_action)
-    sql = """
+    # Outcome by executive action
+    ea = ea_expr(conn)
+    sql = f"""
     SELECT
-        COALESCE(base_executive_action, executive_action) as executive_action,
+        {ea} as executive_action,
         status,
         COUNT(*) as count
     FROM cases
-    WHERE COALESCE(base_executive_action, executive_action) IS NOT NULL
-      AND COALESCE(base_executive_action, executive_action) != ''
-    GROUP BY COALESCE(base_executive_action, executive_action), status
+    WHERE {ea} IS NOT NULL
+      AND {ea} != ''
+    GROUP BY {ea}, status
     ORDER BY executive_action, count DESC
     """
     df = query_df(conn, sql)
