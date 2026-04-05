@@ -28,10 +28,14 @@ CREATE TABLE IF NOT EXISTS cases (
     court_type TEXT,
     judge_name TEXT,
     executive_action TEXT,
+    base_executive_action TEXT,  -- action without "Appeal of ..." suffix
     status TEXT,
     date_filed DATE,
     date_terminated DATE,
     summary TEXT,
+    battle_id INTEGER,           -- clusters related dockets into one "legal battle"
+    is_appeal INTEGER DEFAULT 0, -- 1 if this docket is an appeal of another
+    parent_docket TEXT,          -- docket number this row is an appeal of
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -61,6 +65,7 @@ CREATE TABLE IF NOT EXISTS attorneys (
 -- Index for faster lookups
 CREATE INDEX IF NOT EXISTS idx_cases_normalized ON cases(normalized_case_name);
 CREATE INDEX IF NOT EXISTS idx_cases_cl_docket ON cases(courtlistener_docket_id);
+CREATE INDEX IF NOT EXISTS idx_cases_battle ON cases(battle_id);
 CREATE INDEX IF NOT EXISTS idx_parties_case ON parties(case_id);
 CREATE INDEX IF NOT EXISTS idx_attorneys_case ON attorneys(case_id);
 """
@@ -163,6 +168,151 @@ def parse_date(date_str: str) -> Optional[str]:
     return None
 
 
+def parse_appeal_info(executive_action: str) -> tuple[str, int, Optional[str]]:
+    """
+    Parse the executive action field to detect appeals.
+
+    Returns: (base_action, is_appeal, parent_docket)
+    Examples:
+        "Birthright Citizenship  Appeal of 2:25-cv-00127"
+        -> ("Birthright Citizenship", 1, "2:25-cv-00127")
+
+        "Federal Funding Freeze"
+        -> ("Federal Funding Freeze", 0, None)
+    """
+    if not executive_action:
+        return ("", 0, None)
+
+    # Match "Appeal of <docket_number>" at the end
+    # Docket formats: "1:25-cv-00039", "25-1138", "25-5046", etc.
+    match = re.search(
+        r"(.+?)\s+Appeal\s+of\s+([\d:]+[-\w,;\s]+\d+)",
+        executive_action,
+        re.IGNORECASE,
+    )
+    if match:
+        base_action = match.group(1).strip().rstrip(",;")
+        parent_ref = match.group(2).strip()
+        # Take just the first docket number if there are multiple
+        first_docket = re.match(r"([\d:]+-[\w]+-[\d]+|\d+-\d+)", parent_ref)
+        parent_docket = first_docket.group(1) if first_docket else parent_ref
+        return (base_action, 1, parent_docket)
+
+    return (executive_action.strip(), 0, None)
+
+
+def normalize_plaintiff(case_name: str) -> str:
+    """
+    Extract and normalize the plaintiff name for battle clustering.
+    """
+    # Split on "v." / "v " / "vs."
+    parts = re.split(r"\s+v\.?\s+", case_name, maxsplit=1, flags=re.IGNORECASE)
+    plaintiff = parts[0].strip().lower()
+
+    # Handle consolidated cases with ";" — take the first
+    if ";" in plaintiff:
+        plaintiff = plaintiff.split(";")[0].strip()
+
+    # Normalize common variations
+    plaintiff = re.sub(r"^state of\s+", "", plaintiff)
+    plaintiff = re.sub(r"^commonwealth of\s+", "", plaintiff)
+    plaintiff = re.sub(r",?\s*(inc|llc|et al|pllc|l\.?l\.?c)\.?.*$", "", plaintiff)
+    plaintiff = re.sub(r"\s+", " ", plaintiff).strip()
+
+    return plaintiff
+
+
+def assign_battle_ids(conn: sqlite3.Connection) -> int:
+    """
+    Cluster dockets into legal battles.
+
+    Strategy:
+    1. Link appeals to their parent docket via parent_docket field.
+    2. Group remaining dockets by (base_executive_action, normalized_plaintiff).
+    3. Each group gets a unique battle_id.
+
+    Returns the number of distinct battles.
+    """
+    logger.info("Assigning battle IDs...")
+
+    # Fetch all cases
+    rows = conn.execute(
+        """
+        SELECT id, case_name, docket_number, base_executive_action,
+               is_appeal, parent_docket
+        FROM cases ORDER BY id
+        """
+    ).fetchall()
+
+    # Build lookup: docket_number -> case id(s)
+    docket_to_ids = {}
+    for row in rows:
+        case_id, case_name, docket_num, base_action, is_appeal, parent_docket = row
+        if docket_num:
+            docket_to_ids.setdefault(docket_num, []).append(case_id)
+
+    # Phase 1: Build parent links for appeals
+    # appeal_case_id -> parent_case_id
+    parent_map = {}
+    for row in rows:
+        case_id, case_name, docket_num, base_action, is_appeal, parent_docket = row
+        if is_appeal and parent_docket:
+            parent_ids = docket_to_ids.get(parent_docket, [])
+            if parent_ids:
+                parent_map[case_id] = parent_ids[0]
+
+    # Phase 2: Group non-appeal cases by (base_action, plaintiff)
+    # Then assign appeals to their parent's group
+    group_key_to_ids = {}
+    case_to_group_key = {}
+
+    for row in rows:
+        case_id, case_name, docket_num, base_action, is_appeal, parent_docket = row
+
+        if case_id in parent_map:
+            # This is an appeal — will be assigned to parent's group later
+            continue
+
+        plaintiff = normalize_plaintiff(case_name)
+        action = (base_action or "").strip().lower()
+        group_key = (action, plaintiff)
+
+        group_key_to_ids.setdefault(group_key, []).append(case_id)
+        case_to_group_key[case_id] = group_key
+
+    # Phase 3: Assign appeals to parent's group
+    for appeal_id, parent_id in parent_map.items():
+        if parent_id in case_to_group_key:
+            gk = case_to_group_key[parent_id]
+            group_key_to_ids[gk].append(appeal_id)
+            case_to_group_key[appeal_id] = gk
+        else:
+            # Parent itself is an appeal or wasn't found — make its own group
+            row_data = next(r for r in rows if r[0] == appeal_id)
+            plaintiff = normalize_plaintiff(row_data[1])
+            action = (row_data[3] or "").strip().lower()
+            gk = (action, plaintiff)
+            group_key_to_ids.setdefault(gk, []).append(appeal_id)
+            case_to_group_key[appeal_id] = gk
+
+    # Phase 4: Assign sequential battle_ids
+    battle_id = 0
+    total_assigned = 0
+    for group_key, case_ids in group_key_to_ids.items():
+        battle_id += 1
+        for cid in case_ids:
+            conn.execute(
+                "UPDATE cases SET battle_id = ? WHERE id = ?",
+                (battle_id, cid),
+            )
+            total_assigned += 1
+
+    conn.commit()
+
+    logger.info(f"Assigned {total_assigned} dockets to {battle_id} battles")
+    return battle_id
+
+
 def create_database() -> sqlite3.Connection:
     """Create the SQLite database and schema."""
     # Remove existing database for clean start
@@ -217,20 +367,25 @@ def load_seed_data(conn: sqlite3.Connection) -> int:
             terminated_raw = str(row.get("Terminated", "") or "").strip()
             date_terminated = parse_date(terminated_raw)
 
+            # Parse appeal info from executive_action field
+            base_action, is_appeal, parent_docket = parse_appeal_info(executive_action)
+
             conn.execute(
                 """
                 INSERT INTO cases (
                     case_name, normalized_case_name, courtlistener_docket_id,
-                    docket_number, court, executive_action, status,
-                    summary, date_filed, date_terminated
+                    docket_number, court, executive_action, base_executive_action,
+                    status, summary, date_filed, date_terminated,
+                    is_appeal, parent_docket
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case_name, normalized, cl_docket_id,
                     docket_number or None, jurisdiction or None,
-                    executive_action, status, summary,
+                    executive_action, base_action, status, summary,
                     date_filed, date_terminated,
+                    is_appeal, parent_docket,
                 ),
             )
             inserted += 1
@@ -341,10 +496,13 @@ def main():
             conn.close()
             return 1
 
+        # Assign battle IDs (cluster related dockets)
+        num_battles = assign_battle_ids(conn)
+
         # Print summary
         cursor = conn.execute("SELECT COUNT(*) FROM cases")
         total = cursor.fetchone()[0]
-        logger.info(f"Database contains {total} cases")
+        logger.info(f"Database contains {total} dockets in {num_battles} legal battles")
 
         conn.close()
         logger.info("Seed loader complete!")

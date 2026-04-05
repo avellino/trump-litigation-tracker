@@ -19,35 +19,39 @@ from utils import DB_PATH, DATA_DIR, log_error, logger
 
 def compute_overview_stats(conn: sqlite3.Connection) -> dict:
     """Compute overview statistics."""
-    # Total cases
-    cursor = conn.execute("SELECT COUNT(*) FROM cases")
-    total_cases = cursor.fetchone()[0]
-
-    # Total attorneys
-    cursor = conn.execute("SELECT COUNT(DISTINCT name) FROM attorneys")
-    total_attorneys = cursor.fetchone()[0]
-
-    # Total courts
-    cursor = conn.execute("SELECT COUNT(DISTINCT court) FROM cases WHERE court IS NOT NULL")
-    total_courts = cursor.fetchone()[0]
+    total_dockets = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    total_battles = conn.execute("SELECT COUNT(DISTINCT battle_id) FROM cases WHERE battle_id IS NOT NULL").fetchone()[0]
+    total_appeals = conn.execute("SELECT COUNT(*) FROM cases WHERE is_appeal = 1").fetchone()[0]
+    total_attorneys = conn.execute("SELECT COUNT(DISTINCT name) FROM attorneys").fetchone()[0]
+    total_courts = conn.execute("SELECT COUNT(DISTINCT court) FROM cases WHERE court IS NOT NULL").fetchone()[0]
 
     return {
-        "total_cases": total_cases,
+        "total_dockets": total_dockets,
+        "total_battles": total_battles,
+        "total_appeals": total_appeals,
         "total_attorneys": total_attorneys,
         "total_courts": total_courts,
+        # Keep backward compat
+        "total_cases": total_dockets,
     }
 
 
 def compute_executive_action_counts(conn: sqlite3.Connection) -> list[dict]:
-    """Count cases by executive action type."""
+    """Count cases by executive action type, at both docket and battle level."""
     query = """
-    SELECT executive_action, COUNT(*) as count
+    SELECT
+        COALESCE(base_executive_action, executive_action) as executive_action,
+        COUNT(*) as docket_count,
+        COUNT(DISTINCT battle_id) as battle_count
     FROM cases
-    WHERE executive_action IS NOT NULL AND executive_action != ''
-    GROUP BY executive_action
-    ORDER BY count DESC
+    WHERE COALESCE(base_executive_action, executive_action) IS NOT NULL
+      AND COALESCE(base_executive_action, executive_action) != ''
+    GROUP BY COALESCE(base_executive_action, executive_action)
+    ORDER BY battle_count DESC
     """
     df = pd.read_sql_query(query, conn)
+    # Keep backward compat
+    df["count"] = df["battle_count"]
     return df.to_dict(orient="records")
 
 
@@ -198,11 +202,15 @@ def compute_case_details(conn: sqlite3.Connection) -> list[dict]:
         court_type,
         judge_name,
         executive_action,
+        base_executive_action,
         status,
         date_filed,
         date_terminated,
         summary,
-        courtlistener_docket_id
+        courtlistener_docket_id,
+        battle_id,
+        is_appeal,
+        parent_docket
     FROM cases
     ORDER BY date_filed DESC, case_name
     """
