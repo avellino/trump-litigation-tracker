@@ -251,8 +251,7 @@ def build_org_network(conn: sqlite3.Connection, min_shared_cases: int = 3):
     ))
 
     fig.update_layout(
-        title="Plaintiff Organization Co-Litigation Network",
-        titlefont_size=16,
+        title=dict(text="Plaintiff Organization Co-Litigation Network", font=dict(size=16)),
         showlegend=False,
         hovermode="closest",
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
