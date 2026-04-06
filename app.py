@@ -800,12 +800,19 @@ def page_executive_actions(conn: sqlite3.Connection, analysis: dict):
         filtered = df[df["executive_action"].isin(top_actions)]
 
         if not filtered.empty:
+            all_statuses = sorted(filtered["status"].unique().tolist())
+            selected_statuses = st.multiselect(
+                "Filter by status", all_statuses, default=all_statuses,
+                key="ea_status_filter",
+            )
+            chart_data = filtered[filtered["status"].isin(selected_statuses)]
+
             fig = px.bar(
-                filtered, x="executive_action", y="count", color="status",
+                chart_data, x="executive_action", y="count", color="status",
                 title="Status Breakdown by Executive Action (top 10)",
                 labels={"count": "Dockets", "executive_action": ""},
             )
-            fig.update_layout(xaxis_tickangle=-45, height=500)
+            fig.update_layout(xaxis_tickangle=-45, height=500, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
 
