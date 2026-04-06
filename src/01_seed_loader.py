@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS cases (
     normalized_case_name TEXT,
     docket_number TEXT,
     courtlistener_docket_id INTEGER,
+    courtlistener_url TEXT,
     court TEXT,
     court_type TEXT,
     judge_name TEXT,
@@ -124,6 +125,24 @@ def extract_courtlistener_docket_id(html_str: str) -> Optional[int]:
     match = re.search(r"courtlistener\.com/docket/(\d+)/", html_str)
     if match:
         return int(match.group(1))
+    return None
+
+
+def extract_courtlistener_url(html_str: str) -> Optional[str]:
+    """Extract the full CourtListener or Supreme Court URL from the Lawsuit column HTML link."""
+    if not html_str or not isinstance(html_str, str):
+        return None
+
+    # Try CourtListener URL first
+    match = re.search(r"(https?://www\.courtlistener\.com/docket/\d+/[^\"'\s>]*)", html_str)
+    if match:
+        return match.group(1)
+
+    # Try Supreme Court URL
+    match = re.search(r"(https?://www\.supremecourt\.gov/[^\"'\s>]*)", html_str)
+    if match:
+        return match.group(1)
+
     return None
 
 
@@ -358,6 +377,7 @@ def load_seed_data(conn: sqlite3.Connection) -> int:
 
             normalized = normalize_case_name(case_name)
             cl_docket_id = extract_courtlistener_docket_id(lawsuit_html)
+            cl_url = extract_courtlistener_url(lawsuit_html)
             executive_action = strip_html(str(row.get("Executive Action", "") or ""))
             status = str(row.get("Status", "") or "").strip()
             summary = str(row.get("Summary", "") or "").strip()
@@ -374,14 +394,16 @@ def load_seed_data(conn: sqlite3.Connection) -> int:
                 """
                 INSERT INTO cases (
                     case_name, normalized_case_name, courtlistener_docket_id,
+                    courtlistener_url,
                     docket_number, court, executive_action, base_executive_action,
                     status, summary, date_filed, date_terminated,
                     is_appeal, parent_docket
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case_name, normalized, cl_docket_id,
+                    cl_url,
                     docket_number or None, jurisdiction or None,
                     executive_action, base_action, status, summary,
                     date_filed, date_terminated,

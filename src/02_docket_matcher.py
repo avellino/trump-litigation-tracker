@@ -79,11 +79,17 @@ def extract_docket_info(search_result: dict) -> list[dict]:
         case_name = item.get("case_name", "")
 
         if docket_id:
+            docket_slug = item.get("docket_slug", "")
+            if docket_slug:
+                cl_url = f"https://www.courtlistener.com/docket/{docket_id}/{docket_slug}/"
+            else:
+                cl_url = f"https://www.courtlistener.com/docket/{docket_id}/"
             dockets.append(
                 {
                     "docket_id": docket_id,
                     "case_name": case_name,
                     "source_type": item.get("source_type", ""),
+                    "url": cl_url,
                 }
             )
 
@@ -183,10 +189,10 @@ def main():
             best_match = find_best_match(case_name, dockets)
 
             if best_match:
-                # Update database with docket ID
+                # Update database with docket ID and URL
                 conn.execute(
-                    "UPDATE cases SET courtlistener_docket_id = ? WHERE id = ?",
-                    (best_match["docket_id"], case_id),
+                    "UPDATE cases SET courtlistener_docket_id = ?, courtlistener_url = ? WHERE id = ?",
+                    (best_match["docket_id"], best_match.get("url"), case_id),
                 )
                 matched += 1
                 logger.info(f"  -> Matched to docket {best_match['docket_id']}")

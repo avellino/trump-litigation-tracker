@@ -642,6 +642,7 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
             c.status as "Status",
             c.date_filed as "Date Filed",
             c.docket_number as "Docket #",
+            c.courtlistener_url as cl_url,
             c.courtlistener_docket_id as cl_id,
             c.battle_id,
             b.docket_count as "Related Dockets"
@@ -665,6 +666,7 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
             status as "Status",
             date_filed as "Date Filed",
             docket_number as "Docket #",
+            courtlistener_url as cl_url,
             courtlistener_docket_id as cl_id
             {battle_col}
             {appeal_col}
@@ -684,16 +686,18 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
     label = "battles" if view_mode == "Battles Only" else "dockets"
     st.write(f"Showing {len(df)} {label}")
 
-    # Add clickable CL link
-    df["CourtListener"] = df["cl_id"].apply(
-        lambda x: f"https://www.courtlistener.com/docket/{int(x)}/" if pd.notna(x) else ""
+    # Add clickable docket link — prefer stored full URL, fall back to ID-only
+    df["Docket Link"] = df.apply(
+        lambda row: row["cl_url"] if pd.notna(row.get("cl_url")) and row["cl_url"]
+        else (f"https://www.courtlistener.com/docket/{int(row['cl_id'])}/" if pd.notna(row.get("cl_id")) else ""),
+        axis=1,
     )
-    display_cols = [c for c in df.columns if c not in ("cl_id", "battle_id")]
+    display_cols = [c for c in df.columns if c not in ("cl_id", "cl_url", "battle_id")]
     display_df = df[display_cols]
     event = st.dataframe(display_df, use_container_width=True, hide_index=True,
                          on_select="rerun", selection_mode="single-row",
                          column_config={
-                             "CourtListener": st.column_config.LinkColumn("CourtListener", display_text="View")
+                             "Docket Link": st.column_config.LinkColumn("Docket Link", display_text="View")
                          })
 
     # If user clicked a row in the dataframe, pre-select that case
