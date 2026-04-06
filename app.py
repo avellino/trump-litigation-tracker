@@ -7,6 +7,7 @@ the pre-computed analysis JSON (data/enriched/analysis.json).
 """
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -17,6 +18,84 @@ import streamlit as st
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "data" / "enriched" / "cases.db"
 ANALYSIS_PATH = BASE_DIR / "data" / "enriched" / "analysis.json"
+
+
+# ---------------------------------------------------------------------------
+# Court name lookup
+# ---------------------------------------------------------------------------
+
+COURT_NAMES = {
+    "dcd": "D.C. District Court",
+    "cadc": "D.C. Circuit Court of Appeals",
+    "mad": "D. Mass.",
+    "mdd": "D. Md.",
+    "ca9": "Ninth Circuit",
+    "nysd": "S.D.N.Y.",
+    "cand": "N.D. Cal.",
+    "ca1": "First Circuit",
+    "rid": "D.R.I.",
+    "ca4": "Fourth Circuit",
+    "ilnd": "N.D. Ill.",
+    "wawd": "W.D. Wash.",
+    "mnd": "D. Minn.",
+    "cit": "Court of International Trade",
+    "ca2": "Second Circuit",
+    "cacd": "C.D. Cal.",
+    "ord": "D. Or.",
+    "njd": "D.N.J.",
+    "cod": "D. Colo.",
+    "gamd": "M.D. Ga.",
+    "nhd": "D.N.H.",
+    "vaed": "E.D. Va.",
+    "nynd": "N.D.N.Y.",
+    "paed": "E.D. Pa.",
+    "nyed": "E.D.N.Y.",
+    "txsd": "S.D. Tex.",
+    "scd": "D.S.C.",
+    "vtd": "D. Vt.",
+    "txwd": "W.D. Tex.",
+    "kyed": "E.D. Ky.",
+    "nvd": "D. Nev.",
+    "mtd": "D. Mont.",
+    "med": "D. Me.",
+    "wvsd": "S.D. W.Va.",
+    "ca3": "Third Circuit",
+    "azd": "D. Ariz.",
+    "wiwd": "W.D. Wis.",
+    "casd": "S.D. Cal.",
+    "pawd": "W.D. Pa.",
+    "txnd": "N.D. Tex.",
+    "ca5": "Fifth Circuit",
+    "ca10": "Tenth Circuit",
+    "lawd": "W.D. La.",
+    "hid": "D. Haw.",
+    "miwd": "W.D. Mich.",
+    "tnmd": "M.D. Tenn.",
+    "cafc": "Federal Circuit",
+    "pamd": "M.D. Pa.",
+    "uscfc": "U.S. Court of Federal Claims",
+    "akd": "D. Alaska",
+    "ca7": "Seventh Circuit",
+    "ca6": "Sixth Circuit",
+    "flmd": "M.D. Fla.",
+    "ilsd": "S.D. Ill.",
+    "alsd": "S.D. Ala.",
+    "ca8": "Eighth Circuit",
+    "flsd": "S.D. Fla.",
+    "gand": "N.D. Ga.",
+    "ncwd": "W.D.N.C.",
+}
+
+
+def court_display_name(court_value: str) -> str:
+    """Convert a CourtListener API URL to a readable court name."""
+    if not court_value or not isinstance(court_value, str) or not court_value.startswith("http"):
+        return court_value
+    match = re.search(r'/courts/([^/]+)/?$', court_value)
+    if match:
+        slug = match.group(1)
+        return COURT_NAMES.get(slug, slug.upper())
+    return court_value
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +199,7 @@ def page_overview(conn: sqlite3.Connection, analysis: dict):
     court_data = analysis.get("court_counts", [])
     if court_data:
         df = pd.DataFrame(court_data)
+        df["court"] = df["court"].apply(court_display_name)
         fig = px.bar(
             df.head(20), x="count", y="court",
             orientation="h", title="Dockets by Court (top 20)",
@@ -131,12 +211,44 @@ def page_overview(conn: sqlite3.Connection, analysis: dict):
     # Timeline
     timeline = analysis.get("timeline", [])
     if timeline:
-        df = pd.DataFrame(timeline)
-        fig = px.line(
-            df, x="week", y="count",
-            title="Dockets Filed Over Time (by week)",
-            labels={"week": "Week", "count": "Dockets Filed"},
+        granularity = st.radio(
+            "Timeline granularity",
+            ["Monthly", "Weekly", "Cumulative"],
+            horizontal=True,
+            key="timeline_granularity",
         )
+
+        df = pd.DataFrame(timeline)
+
+        if granularity == "Monthly":
+            # Parse start date from week range and aggregate by month
+            df["month"] = df["week"].str.split("/").str[0].str[:7]
+            df_monthly = df.groupby("month", as_index=False)["count"].sum()
+            df_monthly["month_label"] = pd.to_datetime(df_monthly["month"]).dt.strftime("%b %Y")
+            fig = px.bar(
+                df_monthly, x="month_label", y="count",
+                title="Dockets Filed Over Time (monthly)",
+                labels={"month_label": "", "count": "Dockets Filed"},
+            )
+            fig.update_layout(xaxis_tickangle=-45, height=400)
+
+        elif granularity == "Weekly":
+            fig = px.line(
+                df, x="week", y="count",
+                title="Dockets Filed Over Time (weekly)",
+                labels={"week": "", "count": "Dockets Filed"},
+            )
+            fig.update_layout(xaxis_tickangle=-45, xaxis_nticks=20, height=400)
+
+        else:  # Cumulative
+            df["cumulative"] = df["count"].cumsum()
+            fig = px.line(
+                df, x="week", y="cumulative",
+                title="Cumulative Dockets Filed Over Time",
+                labels={"week": "", "cumulative": "Total Dockets Filed"},
+            )
+            fig.update_layout(xaxis_tickangle=-45, xaxis_nticks=20, height=400)
+
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -389,6 +501,9 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
         """
 
     df = query_df(conn, sql)
+
+    if "Court" in df.columns:
+        df["Court"] = df["Court"].apply(court_display_name)
 
     if search:
         mask = df.apply(lambda row: row.astype(str).str.contains(search, case=False).any(), axis=1)
