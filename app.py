@@ -800,20 +800,77 @@ def page_executive_actions(conn: sqlite3.Connection, analysis: dict):
         filtered = df[df["executive_action"].isin(top_actions)]
 
         if not filtered.empty:
-            all_statuses = sorted(filtered["status"].unique().tolist())
-            selected_statuses = st.multiselect(
-                "Filter by status", all_statuses, default=all_statuses,
+            # Cluster statuses into meaningful categories
+            def categorize_status(status: str) -> str:
+                s = status.lower()
+                # Order matters — check more specific patterns first
+                if any(w in s for w in ["dismissed", "moot", "withdrawn", "terminated", "closed"]):
+                    return "Dismissed / Terminated"
+                if any(w in s for w in ["appealed", "appeal filed", "cert", "writ"]):
+                    return "On Appeal"
+                if any(w in s for w in ["upheld", "affirmed", "mandate returned",
+                                        "remanded", "overturned", "vacated",
+                                        "rehearing", "en banc"]):
+                    return "Appellate Decision"
+                if any(w in s for w in ["stay granted", "stay entered", "stayed",
+                                        "stay and cert", "partial stay",
+                                        "abeyance", "postpone"]):
+                    return "Stayed"
+                if "stay denied" in s or "stay denial" in s or "stay dissolved" in s or "stay found" in s:
+                    return "Stay Denied"
+                if any(w in s for w in ["pi granted", "tro granted", "injunction granted",
+                                        "pi and class", "pi and partial",
+                                        "class certified", "enjoined"]):
+                    return "Injunction / TRO Granted"
+                if any(w in s for w in ["pi denied", "tro denied", "injunction denied",
+                                        "tro and pi denied", "pi denial upheld"]):
+                    return "Injunction / TRO Denied"
+                if "summary judg" in s or "summary judgment" in s:
+                    return "Summary Judgment"
+                if any(w in s for w in ["suit filed", "complaint filed",
+                                        "application filed", "indictment",
+                                        "petition", "suit filed"]):
+                    return "Pending / Filed"
+                if any(w in s for w in ["consolidated", "venue"]):
+                    return "Procedural"
+                return "Other"
+
+            filtered = filtered.copy()
+            filtered["category"] = filtered["status"].apply(categorize_status)
+
+            all_categories = sorted(filtered["category"].unique().tolist())
+            selected_categories = st.multiselect(
+                "Filter by status category", all_categories, default=all_categories,
                 key="ea_status_filter",
             )
-            chart_data = filtered[filtered["status"].isin(selected_statuses)]
+            chart_data = filtered[filtered["category"].isin(selected_categories)]
 
-            fig = px.bar(
-                chart_data, x="executive_action", y="count", color="status",
-                title="Status Breakdown by Executive Action (top 10)",
-                labels={"count": "Dockets", "executive_action": ""},
-            )
-            fig.update_layout(xaxis_tickangle=-45, height=500, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+            if not chart_data.empty:
+                # Aggregate by category for the chart
+                chart_agg = chart_data.groupby(
+                    ["executive_action", "category"], as_index=False
+                )["count"].sum()
+
+                fig = px.bar(
+                    chart_agg, x="executive_action", y="count", color="category",
+                    title="Status Breakdown by Executive Action (top 10)",
+                    labels={"count": "Dockets", "executive_action": "", "category": "Status Category"},
+                    color_discrete_map={
+                        "Pending / Filed": "#636EFA",
+                        "Injunction / TRO Granted": "#00CC96",
+                        "Injunction / TRO Denied": "#EF553B",
+                        "Stayed": "#FFA15A",
+                        "Stay Denied": "#FF6692",
+                        "On Appeal": "#AB63FA",
+                        "Appellate Decision": "#19D3F3",
+                        "Dismissed / Terminated": "#B6E880",
+                        "Summary Judgment": "#FECB52",
+                        "Procedural": "#72B7B2",
+                        "Other": "#999999",
+                    },
+                )
+                fig.update_layout(xaxis_tickangle=-45, height=500)
+                st.plotly_chart(fig, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
