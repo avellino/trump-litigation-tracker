@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 BASE_DIR = Path(__file__).parent
@@ -143,6 +144,124 @@ def ea_expr(conn: sqlite3.Connection, prefix: str = "") -> str:
     if has_column(conn, "base_executive_action"):
         return f"COALESCE({p}base_executive_action, {p}executive_action)"
     return f"{p}executive_action"
+
+
+def build_org_network(conn: sqlite3.Connection, min_shared_cases: int = 3):
+    """Build a co-litigation network of plaintiff-side organizations.
+
+    Returns a plotly Figure showing organizations as nodes and shared cases as edges.
+    Returns None if insufficient data.
+    """
+    sql = f"""
+        SELECT a1.organization AS org1, a2.organization AS org2,
+               COUNT(DISTINCT a1.case_id) AS shared_cases
+        FROM attorneys a1
+        JOIN attorneys a2
+          ON a1.case_id = a2.case_id
+          AND a1.organization < a2.organization
+        WHERE a1.role = 'plaintiff_attorney'
+          AND a2.role = 'plaintiff_attorney'
+          AND a1.organization IS NOT NULL
+          AND a2.organization IS NOT NULL
+          AND a1.organization != ''
+          AND a2.organization != ''
+        GROUP BY a1.organization, a2.organization
+        HAVING shared_cases >= {min_shared_cases}
+        ORDER BY shared_cases DESC
+    """
+    edges_df = query_df(conn, sql)
+
+    if edges_df.empty:
+        return None
+
+    # Total case counts per org for node sizing
+    org_counts_sql = """
+        SELECT organization, COUNT(DISTINCT case_id) AS case_count
+        FROM attorneys
+        WHERE role = 'plaintiff_attorney'
+          AND organization IS NOT NULL AND organization != ''
+        GROUP BY organization
+    """
+    org_counts = query_df(conn, org_counts_sql)
+    org_size = dict(zip(org_counts["organization"], org_counts["case_count"]))
+
+    # Build node list from edges
+    all_orgs = sorted(set(edges_df["org1"].tolist() + edges_df["org2"].tolist()))
+    n = len(all_orgs)
+
+    # Circular layout as default
+    import math
+    positions = {}
+    for i, org in enumerate(all_orgs):
+        angle = 2 * math.pi * i / n
+        positions[org] = (math.cos(angle), math.sin(angle))
+
+    # Use spring layout if networkx is available
+    try:
+        import networkx as nx
+        G = nx.Graph()
+        for _, row in edges_df.iterrows():
+            G.add_edge(row["org1"], row["org2"], weight=row["shared_cases"])
+        positions = nx.spring_layout(G, k=2.0 / math.sqrt(n), iterations=50, seed=42)
+    except ImportError:
+        pass
+
+    max_weight = edges_df["shared_cases"].max()
+
+    fig = go.Figure()
+
+    # Edge traces with weight-based styling
+    for _, row in edges_df.iterrows():
+        x0, y0 = positions[row["org1"]]
+        x1, y1 = positions[row["org2"]]
+        weight = row["shared_cases"]
+        opacity = 0.2 + 0.6 * (weight / max_weight)
+        width = 0.5 + 2.5 * (weight / max_weight)
+
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[y0, y1],
+            mode="lines",
+            line=dict(width=width, color=f"rgba(100,100,100,{opacity})"),
+            hoverinfo="text",
+            hovertext=f"{row['org1']} ↔ {row['org2']}: {weight} shared cases",
+            showlegend=False,
+        ))
+
+    # Node trace
+    node_x = [positions[org][0] for org in all_orgs]
+    node_y = [positions[org][1] for org in all_orgs]
+    node_sizes = [max(8, min(40, org_size.get(org, 1) * 1.5)) for org in all_orgs]
+    node_text = [f"{org}<br>{org_size.get(org, 0)} cases" for org in all_orgs]
+    node_labels = [org if len(org) <= 25 else org[:22] + "..." for org in all_orgs]
+
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text",
+        text=node_labels,
+        textposition="top center",
+        textfont=dict(size=9),
+        hovertext=node_text,
+        hoverinfo="text",
+        marker=dict(
+            size=node_sizes,
+            color="#2166ac",
+            line=dict(width=1, color="white"),
+        ),
+        showlegend=False,
+    ))
+
+    fig.update_layout(
+        title="Plaintiff Organization Co-Litigation Network",
+        titlefont_size=16,
+        showlegend=False,
+        hovermode="closest",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=600,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +412,27 @@ def page_attorneys(conn: sqlite3.Connection, analysis: dict):
         fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=600)
         st.plotly_chart(fig, use_container_width=True)
 
+    # Co-litigation network
+    st.divider()
+    st.subheader("Co-Litigation Network")
+    st.caption(
+        "Organizations that appear together as plaintiff-side counsel on the same dockets. "
+        "Node size = total cases for that organization. Edges connect organizations that "
+        "co-appear on 3+ dockets together."
+    )
+
+    min_shared = st.slider(
+        "Minimum shared cases to show a connection",
+        min_value=2, max_value=10, value=3, step=1,
+        key="network_min_shared",
+    )
+
+    network_fig = build_org_network(conn, min_shared_cases=min_shared)
+    if network_fig:
+        st.plotly_chart(network_fig, use_container_width=True)
+    else:
+        st.info("Not enough co-litigation data to build a network at this threshold.")
+
 
 # ---------------------------------------------------------------------------
 # Page: Judge Analysis
@@ -423,17 +563,50 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
     fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=500)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Outcome rates
+    # Outcome rates — scatter plot
     if any(row.get("injunction_rate", 0) > 0 or row.get("dismissal_rate", 0) > 0 for row in judge_data):
         st.subheader("Outcome Rates by Judge")
-        fig = px.bar(
-            df[df["case_count"] >= 2].head(20),
-            x="judge_name", y=["injunction_rate", "dismissal_rate"],
-            barmode="group",
-            title="Injunction vs Dismissal Rate (judges with 2+ dockets)",
-            labels={"value": "Rate (%)", "judge_name": ""},
+
+        scatter_df = df[df["case_count"] >= 2].copy()
+
+        if "appointed_by" in scatter_df.columns:
+            color_col = "appointed_by"
+            color_map = president_colors
+        else:
+            color_col = None
+            color_map = None
+
+        fig = px.scatter(
+            scatter_df,
+            x="dismissal_rate",
+            y="injunction_rate",
+            size="case_count",
+            color=color_col,
+            color_discrete_map=color_map,
+            hover_name="judge_name",
+            hover_data={"case_count": True, "injunction_rate": ":.1f", "dismissal_rate": ":.1f"},
+            title="Injunction Rate vs Dismissal Rate (judges with 2+ dockets)",
+            labels={
+                "dismissal_rate": "Dismissal Rate (%)",
+                "injunction_rate": "Injunction Rate (%)",
+                "case_count": "Docket Count",
+                "appointed_by": "Appointed By",
+            },
+            size_max=30,
         )
+
+        fig.update_layout(
+            height=500,
+            xaxis=dict(range=[-2, max(scatter_df["dismissal_rate"].max() + 5, 40)]),
+            yaxis=dict(range=[-2, max(scatter_df["injunction_rate"].max() + 5, 40)]),
+        )
+
         st.plotly_chart(fig, use_container_width=True)
+
+        st.caption(
+            "Each dot is a judge. Dot size = number of dockets assigned. "
+            "Color = party of appointing president. Hover for details."
+        )
 
 
 # ---------------------------------------------------------------------------
