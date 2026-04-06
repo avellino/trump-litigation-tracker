@@ -690,11 +690,22 @@ def page_cases(conn: sqlite3.Connection, analysis: dict):
     )
     display_cols = [c for c in df.columns if c not in ("cl_id", "battle_id")]
     display_df = df[display_cols]
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    event = st.dataframe(display_df, use_container_width=True, hide_index=True,
+                         on_select="rerun", selection_mode="single-row",
+                         column_config={
+                             "CourtListener": st.column_config.LinkColumn("CourtListener", display_text="View")
+                         })
+
+    # If user clicked a row in the dataframe, pre-select that case
+    clicked_index = None
+    if event and event.selection and event.selection.rows:
+        clicked_index = event.selection.rows[0]
 
     # Case detail expander
     if not df.empty:
-        selected = st.selectbox("Select a case for details", df["Case Name"].tolist())
+        case_names = df["Case Name"].tolist()
+        default_idx = clicked_index if clicked_index is not None else 0
+        selected = st.selectbox("Select a case for details", case_names, index=default_idx)
         if selected:
             case_row = df[df["Case Name"] == selected].iloc[0]
             battle_id = case_row.get("battle_id")
