@@ -532,35 +532,78 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
     else:
         st.dataframe(df.head(30), use_container_width=True, hide_index=True)
 
-    # Bar chart colored by appointer
+    # Appointer filter checkboxes
+    president_colors = {
+        "Barack Obama": "#2166ac",
+        "Donald Trump": "#b2182b",
+        "Joe Biden": "#2166ac",
+        "George W. Bush": "#b2182b",
+        "Bill Clinton": "#2166ac",
+        "Ronald Reagan": "#b2182b",
+        "George H.W. Bush": "#b2182b",
+        "Jimmy Carter": "#2166ac",
+        "Unknown": "#999999",
+    }
+
+    if "appointed_by" in df.columns:
+        all_appointers = sorted(df["appointed_by"].dropna().unique().tolist())
+
+        # Build the filter first (need it before the chart)
+        selected_appointers = []
+        appointer_checks = {}
+        for appt in all_appointers:
+            appointer_checks[appt] = st.session_state.get(f"appt_{appt}", True)
+            if appointer_checks[appt]:
+                selected_appointers.append(appt)
+
+        df = df[df["appointed_by"].isin(selected_appointers)]
+
+    # Bar chart with filter legend to the right
     chart_df = df.head(20).copy()
-    if "appointed_by" in chart_df.columns:
-        president_colors = {
-            "Barack Obama": "#2166ac",
-            "Donald Trump": "#b2182b",
-            "Joe Biden": "#2166ac",
-            "George W. Bush": "#b2182b",
-            "Bill Clinton": "#2166ac",
-            "Ronald Reagan": "#b2182b",
-            "George H.W. Bush": "#b2182b",
-            "Jimmy Carter": "#2166ac",
-            "Unknown": "#999999",
-        }
-        fig = px.bar(
-            chart_df, x="case_count", y="judge_name",
-            color="appointed_by",
-            orientation="h", title="Top 20 Judges by Docket Count",
-            labels={"case_count": "Dockets", "judge_name": "", "appointed_by": "Appointed By"},
-            color_discrete_map=president_colors,
-        )
-    else:
-        fig = px.bar(
-            chart_df, x="case_count", y="judge_name",
-            orientation="h", title="Top 20 Judges by Docket Count",
-            labels={"case_count": "Dockets", "judge_name": ""},
-        )
-    fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=500)
-    st.plotly_chart(fig, use_container_width=True)
+    col_chart, col_legend = st.columns([4, 1])
+
+    with col_chart:
+        if "appointed_by" in chart_df.columns:
+            fig = px.bar(
+                chart_df, x="case_count", y="judge_name",
+                color="appointed_by",
+                orientation="h",
+                labels={"case_count": "Dockets", "judge_name": "", "appointed_by": "Appointed By"},
+                color_discrete_map=president_colors,
+            )
+        else:
+            fig = px.bar(
+                chart_df, x="case_count", y="judge_name",
+                orientation="h",
+                labels={"case_count": "Dockets", "judge_name": ""},
+            )
+        fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=500,
+                          showlegend=False, margin=dict(t=10))
+        st.markdown("**Top 20 Judges by Docket Count**")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_legend:
+        if "appointed_by" in df.columns:
+            dem_presidents = {"Barack Obama", "Joe Biden", "Bill Clinton", "Jimmy Carter",
+                              "Lyndon B. Johnson", "John F. Kennedy"}
+            rep_presidents = {"Donald Trump", "George W. Bush", "George H.W. Bush",
+                              "Ronald Reagan", "Richard Nixon", "Gerald Ford"}
+
+            def party_icon(name: str) -> str:
+                if name in dem_presidents:
+                    return "\U0001f7e6"  # blue square
+                elif name in rep_presidents:
+                    return "\U0001f7e5"  # red square
+                return "\u2b1c"  # white square
+
+            st.markdown("**Appointed by:**")
+            # Reduce vertical spacing between checkboxes
+            st.markdown(
+                "<style>.stCheckbox { margin-top: -12px; }</style>",
+                unsafe_allow_html=True,
+            )
+            for appt in all_appointers:
+                st.checkbox(f"{party_icon(appt)} {appt}", value=True, key=f"appt_{appt}")
 
     # Outcome rates — scatter plot
     if any(row.get("injunction_rate", 0) > 0 or row.get("dismissal_rate", 0) > 0 for row in judge_data):
@@ -596,6 +639,7 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
 
         fig.update_layout(
             height=500,
+            showlegend=False,
             xaxis=dict(range=[-2, max(scatter_df["dismissal_rate"].max() + 5, 40)]),
             yaxis=dict(range=[-2, max(scatter_df["injunction_rate"].max() + 5, 40)]),
         )
