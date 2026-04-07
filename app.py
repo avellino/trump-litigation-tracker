@@ -605,11 +605,25 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
             for appt in all_appointers:
                 st.checkbox(f"{party_icon(appt)} {appt}", value=True, key=f"appt_{appt}")
 
-    # Outcome rates — scatter plot
+    # Outcome rates — bubble chart with opacity and grouped hover
     if any(row.get("injunction_rate", 0) > 0 or row.get("dismissal_rate", 0) > 0 for row in judge_data):
         st.subheader("Outcome Rates by Judge")
 
         scatter_df = df[df["case_count"] >= 2].copy()
+
+        # Build hover text that lists ALL judges at each (x, y) position
+        grouped = scatter_df.groupby(["dismissal_rate", "injunction_rate"])
+        hover_map = {}
+        for (dr, ir), group in grouped:
+            lines = []
+            for _, row_data in group.iterrows():
+                appt = f" ({row_data['appointed_by']})" if "appointed_by" in group.columns else ""
+                lines.append(f"{row_data['judge_name']}: {int(row_data['case_count'])} dockets{appt}")
+            hover_map[(dr, ir)] = f"<b>{len(group)} judge{'s' if len(group) > 1 else ''} at this position:</b><br>" + "<br>".join(lines)
+
+        scatter_df["hover_text"] = scatter_df.apply(
+            lambda r: hover_map[(r["dismissal_rate"], r["injunction_rate"])], axis=1
+        )
 
         if "appointed_by" in scatter_df.columns:
             color_col = "appointed_by"
@@ -625,8 +639,7 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
             size="case_count",
             color=color_col,
             color_discrete_map=color_map,
-            hover_name="judge_name",
-            hover_data={"case_count": True, "injunction_rate": ":.1f", "dismissal_rate": ":.1f"},
+            custom_data=["hover_text"],
             title="Injunction Rate vs Dismissal Rate (judges with 2+ dockets)",
             labels={
                 "dismissal_rate": "Dismissal Rate (%)",
@@ -635,6 +648,11 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
                 "appointed_by": "Appointed By",
             },
             size_max=30,
+        )
+
+        fig.update_traces(
+            opacity=0.6,
+            hovertemplate="%{customdata[0]}<extra></extra>",
         )
 
         fig.update_layout(
@@ -647,8 +665,8 @@ def page_judges(conn: sqlite3.Connection, analysis: dict):
         st.plotly_chart(fig, use_container_width=True)
 
         st.caption(
-            "Each dot is a judge. Dot size = number of dockets assigned. "
-            "Color = party of appointing president. Hover for details."
+            "Each bubble is a judge. Dot size = number of dockets. "
+            "Opacity reveals overlapping judges. Hover to see all judges at a position."
         )
 
 
