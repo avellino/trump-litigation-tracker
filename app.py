@@ -900,39 +900,64 @@ def page_executive_actions(conn: sqlite3.Connection, analysis: dict):
             filtered = filtered.copy()
             filtered["category"] = filtered["status"].apply(categorize_status)
 
+            category_colors = {
+                "Pending / Filed": "#636EFA",
+                "Injunction / TRO Granted": "#00CC96",
+                "Injunction / TRO Denied": "#EF553B",
+                "Stayed": "#FFA15A",
+                "Stay Denied": "#FF6692",
+                "On Appeal": "#AB63FA",
+                "Appellate Decision": "#19D3F3",
+                "Dismissed / Terminated": "#B6E880",
+                "Summary Judgment": "#FECB52",
+                "Procedural": "#72B7B2",
+                "Other": "#999999",
+            }
+
             all_categories = sorted(filtered["category"].unique().tolist())
-            selected_categories = st.multiselect(
-                "Filter by status category", all_categories, default=all_categories,
-                key="ea_status_filter",
-            )
+
+            # Read checkbox state before rendering (same pattern as Judge Analysis)
+            selected_categories = [
+                cat for cat in all_categories
+                if st.session_state.get(f"ea_cat_{cat}", True)
+            ]
+
             chart_data = filtered[filtered["category"].isin(selected_categories)]
 
-            if not chart_data.empty:
-                # Aggregate by category for the chart
-                chart_agg = chart_data.groupby(
-                    ["executive_action", "category"], as_index=False
-                )["count"].sum()
+            col_chart, col_legend = st.columns([4, 1])
 
-                fig = px.bar(
-                    chart_agg, x="executive_action", y="count", color="category",
-                    title="Status Breakdown by Executive Action (top 10)",
-                    labels={"count": "Dockets", "executive_action": "", "category": "Status Category"},
-                    color_discrete_map={
-                        "Pending / Filed": "#636EFA",
-                        "Injunction / TRO Granted": "#00CC96",
-                        "Injunction / TRO Denied": "#EF553B",
-                        "Stayed": "#FFA15A",
-                        "Stay Denied": "#FF6692",
-                        "On Appeal": "#AB63FA",
-                        "Appellate Decision": "#19D3F3",
-                        "Dismissed / Terminated": "#B6E880",
-                        "Summary Judgment": "#FECB52",
-                        "Procedural": "#72B7B2",
-                        "Other": "#999999",
-                    },
+            with col_chart:
+                if not chart_data.empty:
+                    chart_agg = chart_data.groupby(
+                        ["executive_action", "category"], as_index=False
+                    )["count"].sum()
+
+                    fig = px.bar(
+                        chart_agg, x="executive_action", y="count", color="category",
+                        labels={"count": "Dockets", "executive_action": "", "category": "Status Category"},
+                        color_discrete_map=category_colors,
+                    )
+                    fig.update_layout(xaxis_tickangle=-45, height=500,
+                                      showlegend=False, margin=dict(t=10))
+                    st.markdown("**Status Breakdown by Executive Action (top 10)**")
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with col_legend:
+                st.markdown("**Status category:**")
+                st.markdown(
+                    "<style>.stCheckbox { margin-top: -12px; }</style>",
+                    unsafe_allow_html=True,
                 )
-                fig.update_layout(xaxis_tickangle=-45, height=500)
-                st.plotly_chart(fig, use_container_width=True)
+                for cat in all_categories:
+                    color = category_colors.get(cat, "#999999")
+                    swatch_col, cb_col = st.columns([0.12, 0.88])
+                    with swatch_col:
+                        st.markdown(
+                            f'<div style="width:14px;height:14px;background:{color};border-radius:2px;margin-top:8px;"></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with cb_col:
+                        st.checkbox(cat, value=True, key=f"ea_cat_{cat}")
 
 
 # ---------------------------------------------------------------------------
